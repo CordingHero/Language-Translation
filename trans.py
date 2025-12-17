@@ -7,16 +7,18 @@ from tqdm import tqdm
 import time
 import random
 import re
+import concurrent.futures # 나중에 더 고도화할 때 사용할 수 있도록 import
 
 # ==========================================
 # 설정
 # ==========================================
 BATCH_SIZE = 50
-MAX_CHAR_LIMIT = 4500
+MAX_CHAR_LIMIT = 4500 # 이 값은 deep-translator 라이브러리가 내부적으로 처리하므로, 여기서는 참조용입니다.
+MAX_BATCH_RETRIES = 3 # 배치 번역 실패 시 최대 재시도 횟수
 # ==========================================
 
 # ----------------------------------------------------
-# 변수 보호를 위한 마스킹/언마스킹 함수
+# 변수 보호를 위한 마스킹/언마스킹 함수 (이전과 동일)
 # ----------------------------------------------------
 def mask_variables(text):
     if not isinstance(text, str):
@@ -43,27 +45,94 @@ def unmask_variables(text, variables):
     return restored_text
 
 # ----------------------------------------------------
-# 언어 코드 파싱 함수 (자동 감지용)
+# 언어 코드 파싱 함수 (자동 감지용) (이전과 동일)
 # ----------------------------------------------------
 def parse_lang_code(cell_value):
-    """
-    셀 값(예: id-ID, ar-SA, fr-CH)에서 deep-translator가 이해하는
-    ISO 639-1 코드(예: id, ar, fr)를 추출합니다.
-    """
     if not cell_value or not isinstance(cell_value, str):
         return None
     
     val = cell_value.strip()
     
-    # 'Key', '설명' 등은 건너뜀 (알파벳이 아니거나 길이가 맞지 않는 경우 필터링)
-    # 1. 구분자(- 또는 _)로 분리 후 첫 번째 파트 가져오기
     part = re.split(r'[-_]', val)[0]
     
-    # 2. 길이가 2자리이고 알파벳인 경우만 유효한 언어 코드로 인정 (ex: en, ko, id, ar)
     if len(part) == 2 and part.isalpha():
         return part.lower()
     
     return None
+
+# ----------------------------------------------------
+# 배치 번역 처리 함수 (속도 개선 로직 적용)
+# ----------------------------------------------------
+def process_batch_translation(translator, text_list_for_lang):
+    """
+    주어진 언어의 전체 텍스트 목록을 BATCH_SIZE 단위로 나누어 번역하고,
+    실패 시 재시도 로직을 적용합니다.
+    """
+    results = []
+    if not text_list_for_lang:
+        return results
+
+    # 전체 텍스트 목록을 BATCH_SIZE 단위로 처리
+    for i in range(0, len(text_list_for_lang), BATCH_SIZE):
+        current_sub_batch_raw = text_list_for_lang[i : i + BATCH_SIZE]
+
+        # 1. 변수 마스킹
+        masked_sub_batch = []
+        sub_batch_vars = []
+        for text_item in current_sub_batch_raw:
+            m_text, vars_list = mask_variables(text_item)
+            masked_sub_batch.append(m_text)
+            sub_batch_vars.append(vars_list)
+
+        translated_sub_batch = []
+        batch_translation_successful = False
+
+        # 2. 배치 번역 시도 (재시도 로직 포함)
+        for retry_attempt in range(MAX_BATCH_RETRIES + 1):
+            try:
+                # 첫 시도 시에는 대기 시간 없이 바로 번역 요청
+                if retry_attempt > 0:
+                    # 재시도 시 지수 백오프 (2초, 4초, 8초 + 랜덤 지연)
+                    sleep_time = (2 ** (retry_attempt - 1)) + random.uniform(0, 1)
+                    print(f"\n   ⚠️ 배치 번역 재시도 {retry_attempt}/{MAX_BATCH_RETRIES} 중 (대기 {int(sleep_time)}초)...")
+                    time.sleep(sleep_time)
+                
+                translated_sub_batch = translator.translate_batch(masked_sub_batch)
+                batch_translation_successful = True
+                break # 성공 시 재시도 루프 탈출
+            except Exception as e:
+                print(f"\n⚠️ 배치 번역 실패 (오류: {e}).")
+                if retry_attempt == MAX_BATCH_RETRIES:
+                    print("   모든 배치 재시도 실패. 개별 번역으로 폴백합니다.")
+                    # 모든 배치 재시도 실패 시 개별 번역으로 폴백
+                    translated_sub_batch = []
+                    for idx, text_item in enumerate(masked_sub_batch):
+                        try:
+                            # 개별 번역 시에는 API 과부하를 줄이기 위해 작은 딜레이를 줍니다.
+                            time.sleep(0.5)
+                            t_text = translator.translate(text_item)
+                            translated_sub_batch.append(t_text)
+                        except Exception as single_e:
+                            print(f"     개별 번역 실패 for text '{text_item[:min(len(text_item), 50)]}...': {single_e}")
+                            translated_sub_batch.append(current_sub_batch_raw[idx]) # 원문 추가
+                    batch_translation_successful = True # 폴백 성공으로 간주
+                    break # 재시도 루프 탈출
+
+        # 3. 언마스킹 및 결과 저장
+        final_sub_batch = []
+        if batch_translation_successful:
+            for j, trans_text in enumerate(translated_sub_batch):
+                if trans_text:
+                    restored = unmask_variables(trans_text, sub_batch_vars[j] if j < len(sub_batch_vars) else [])
+                    final_sub_batch.append(restored)
+                else:
+                    # 번역 실패 시 원문 유지 (또는 빈 문자열)
+                    final_sub_batch.append(current_sub_batch_raw[j] if j < len(current_sub_batch_raw) else "")
+        else: # 모든 재시도 및 폴백 실패 시 (거의 일어나지 않겠지만) 원문 유지
+             final_sub_batch = current_sub_batch_raw
+
+        results.extend(final_sub_batch)
+    return results
 
 # ----------------------------------------------------
 # 메인 로직
@@ -86,47 +155,6 @@ else:
             "Cms"
         ]
 
-        # 배치 번역 처리 함수
-        def process_batch_translation(translator, text_list):
-            results = []
-            if not text_list:
-                return results
-
-            for i in range(0, len(text_list), BATCH_SIZE):
-                batch = text_list[i : i + BATCH_SIZE]
-                masked_batch = []
-                batch_vars = []
-
-                for text in batch:
-                    m_text, vars_list = mask_variables(text)
-                    masked_batch.append(m_text)
-                    batch_vars.append(vars_list)
-
-                translated_batch = []
-                try:
-                    time.sleep(random.uniform(0.5, 1.5))
-                    translated_batch = translator.translate_batch(masked_batch)
-                except Exception as e:
-                    print(f"\n⚠️ 배치 번역 실패 (재시도 중...): {e}")
-                    for idx, text in enumerate(masked_batch):
-                        try:
-                            time.sleep(1)
-                            t_text = translator.translate(text)
-                            translated_batch.append(t_text)
-                        except:
-                            translated_batch.append(text)
-
-                final_batch = []
-                for j, trans_text in enumerate(translated_batch):
-                    if trans_text:
-                        restored = unmask_variables(trans_text, batch_vars[j])
-                        final_batch.append(restored)
-                    else:
-                        final_batch.append(trans_text)
-                results.extend(final_batch)
-
-            return results
-
         # 시트 순회
         for sheet_name in target_sheets:
             if sheet_name not in wb.sheetnames: continue
@@ -138,7 +166,6 @@ else:
             header_row = None
             source_col = None
             
-            # 처음 15행까지 스캔하여 'en-US'가 있는 위치를 찾음
             for r in range(1, min(16, ws.max_row + 1)):
                 for c in range(1, ws.max_column + 1):
                     val = str(ws.cell(row=r, column=c).value).strip()
@@ -149,15 +176,14 @@ else:
                 if header_row: break
 
             if not header_row or not source_col:
-                print(f"   ⚠️ 'en-US' 컬럼을 찾을 수 없어 [{sheet_name}] 시트를 건너뜁니다.")
+                print(f"   ⚠️ 'en-US' 컬럼을 찾을 수 없어 [{sheet_name}] 시트를 건너뜜니다.")
                 continue
 
             # 2. 헤더 행을 분석하여 타겟 언어 컬럼들 자동 매핑
-            # 예: id-ID -> id, en-IN -> en, ar-SA -> ar
             target_cols = {} # { col_idx: 'lang_code' }
             
             for c in range(1, ws.max_column + 1):
-                if c == source_col: continue # 원본 컬럼은 스킵
+                if c == source_col: continue
 
                 header_val = ws.cell(row=header_row, column=c).value
                 lang_code = parse_lang_code(header_val)
@@ -165,7 +191,7 @@ else:
                 if lang_code:
                     target_cols[c] = lang_code
             
-            print(f"   ℹ️ 감지된 언어: {list(set(target_cols.values()))}")
+            print(f"   ℹ️ 감지된 번역 대상 언어: {list(set(target_cols.values()))}")
             if not target_cols:
                 print("   ⚠️ 번역할 대상 언어 컬럼(예: id-ID, ar-SA)을 찾지 못했습니다.")
                 continue
@@ -185,7 +211,6 @@ else:
                         target_cell = ws.cell(row=row, column=col_idx)
                         cell_val = target_cell.value
 
-                        # 이미 값이 있으면 스킵
                         if cell_val is not None and str(cell_val).strip() != "":
                             total_skip_count += 1
                             continue
@@ -193,8 +218,7 @@ else:
                         tasks_by_lang[lang_code].append({
                             'row': row,
                             'col': col_idx,
-                            'text': en_text,
-                            'header_origin': ws.cell(row=header_row, column=col_idx).value # 로깅용
+                            'text': en_text
                         })
                         total_add_count += 1
 
@@ -208,7 +232,7 @@ else:
             for lang_code, tasks in tasks_by_lang.items():
                 if not tasks: continue
 
-                # [중요] 타겟 언어코드가 'en'인 경우 (en-IN, en-PH 등) -> 번역 없이 원문 복사
+                # 타겟 언어코드가 'en'인 경우 (en-IN, en-PH 등) -> 번역 없이 원문 복사
                 if lang_code == 'en':
                     print(f"   👉 [English Variant] 영어 변형({lang_code})은 원문 복사 중... ({len(tasks)}개)")
                     for task in tasks:
@@ -219,32 +243,27 @@ else:
                 print(f"   👉 [{lang_code}] 번역 진행 중... ({len(tasks)}개)")
 
                 translator = GoogleTranslator(source='en', target=lang_code)
-                texts_to_translate = [t['text'] for t in tasks]
-                translated_texts = []
+                texts_to_translate_for_this_lang = [t['text'] for t in tasks]
+                
+                # 수정된 process_batch_translation 함수 호출
+                translated_texts_for_this_lang = process_batch_translation(translator, texts_to_translate_for_this_lang)
 
-                # tqdm 진행바 표시
-                with tqdm(total=len(texts_to_translate), desc=f"   Translating to {lang_code}") as pbar:
-                    for i in range(0, len(texts_to_translate), BATCH_SIZE):
-                        batch_texts = texts_to_translate[i : i + BATCH_SIZE]
-                        batch_results = process_batch_translation(translator, batch_texts)
-                        translated_texts.extend(batch_results)
-                        pbar.update(len(batch_texts))
-
-                # 결과 엑셀에 쓰기
-                for i, task in enumerate(tasks):
-                    if i < len(translated_texts):
-                        ws.cell(row=task['row'], column=task['col']).value = translated_texts[i]
+                # tqdm 진행바 표시 및 결과 엑셀에 쓰기
+                with tqdm(total=len(tasks), desc=f"   Applying {lang_code} translations") as pbar:
+                    for i, task in enumerate(tasks):
+                        if i < len(translated_texts_for_this_lang):
+                            ws.cell(row=task['row'], column=task['col']).value = translated_texts_for_this_lang[i]
+                        pbar.update(1)
 
             print(f"   ✨ [{sheet_name}] 작업 완료")
 
-        output_path = "NextS_AutoDetected_Updated.xlsx"
+        output_path = "NextS_AutoDetected_Faster_Updated.xlsx"
         wb.save(output_path)
         print(f"\n🎉 모든 작업 완료! 저장됨: {output_path}")
         files.download(output_path)
 
     except Exception as e:
         print(f"오류 발생: {e}")
-        # 오류 발생 시에도 현재까지 작업한 내용은 저장 시도
         try:
             wb.save("Backup_Error.xlsx")
             files.download("Backup_Error.xlsx")
